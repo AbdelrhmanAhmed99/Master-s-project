@@ -1,0 +1,37 @@
+# Dataset files
+/data/
+
+# Kaggle API token
+kaggle.json
+
+# Training checkpoints & outputs
+checkpoints/
+re_implementation/checkpoints/
+re_implementation/testing_res*/
+
+# SentencePiece models & encoding cache
+re_implementation/checkpoints/sp/
+*.model
+*.vocab
+*.pt
+*.meta
+
+# Experiment logs
+re_implementation/experiment*.log
+re_implementation/experiment.log
+*.log
+
+# Python environments
+re_implementation/.venv/
+re_implementation/.conda_env/
+.venv/
+.conda_env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Misc
+.DS_Store
+*.egg-info/
