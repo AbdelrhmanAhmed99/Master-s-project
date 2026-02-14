@@ -1,0 +1,14 @@
+Evaluated 2737 sentence pairs
+Tokenizer: SentencePiece BPE (vocab 32,000)
+
+BLEU-1: 0.4108
+BLEU-2: 0.2240
+BLEU-3: 0.1438
+BLEU-4: 0.0963
+
+ROUGE-1  P:0.4668  R:0.4263  F:0.4376
+ROUGE-2  P:0.2341  R:0.2121  F:0.2184
+ROUGE-L  P:0.4267  R:0.3897  F:0.4000
+
+Avg predicted length (subwords): 27.3
+Avg reference length (subwords): 29.6
