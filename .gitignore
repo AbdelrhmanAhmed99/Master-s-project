@@ -7,7 +7,6 @@ kaggle.json
 # Training checkpoints & outputs
 checkpoints/
 re_implementation/checkpoints/
-re_implementation/testing_res*/
 
 # SentencePiece models & encoding cache
 re_implementation/checkpoints/sp/
