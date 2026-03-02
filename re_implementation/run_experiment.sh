@@ -2,9 +2,11 @@
 # ==================================================================
 #  run_experiment.sh — Full training + evaluation pipeline
 #
-#  Hyperparameters chosen to match the reference paper:
-#    emb_dim=128, hidden=256, 1 layer, 10 epochs, lr=0.001, clip=5
-#  with our SentencePiece BPE tokenizer (32K shared vocab).
+#  Multilingual many → English NMT (5 language pairs):
+#    de → en,  fr → en,  cs → en,  ru → en,  es → en
+#
+#  Uses a Seq2Seq + Bahdanau attention model with a shared
+#  SentencePiece BPE tokenizer (32K vocab).
 #
 #  Run with:  screen -S experiment bash run_experiment.sh
 # ==================================================================
@@ -12,7 +14,7 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────
-DATA_DIR="../data"
+DATA_DIR="/workspace/Datasets"
 SAVE_DIR="./checkpoints"
 OUTPUT_DIR="./testing_res"
 LOG_FILE="./experiment.log"
@@ -51,7 +53,7 @@ log() { echo "[$(timestamp)] $*" | tee -a "$LOG_FILE"; }
 # ── Start ─────────────────────────────────────────────────────
 echo "" >> "$LOG_FILE"
 log "============================================================"
-log "  EXPERIMENT START"
+log "  EXPERIMENT START — Multilingual NMT (many → English)"
 log "============================================================"
 log "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 log "  Python: $(python3 --version 2>&1)"
@@ -101,6 +103,7 @@ log ""
 
 # ── Phase 2: Evaluation ──────────────────────────────────────
 log ">>> PHASE 2: Evaluation (beam search, beam_size=${BEAM_SIZE})"
+log "    Per-language + combined metrics for all 5 pairs"
 log ""
 
 python3 evaluate.py \

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-train.py — Command-line training script for the Seq2Seq model.
+train.py — Command-line training script for multilingual Seq2Seq NMT.
+
+Trains a many → English translation model on 5 language pairs:
+    de → en,  fr → en,  cs → en,  ru → en,  es → en
 
 Training can be controlled via **steps** or **epochs**:
 
@@ -16,15 +19,15 @@ limited GPU memory:
 Usage examples
 --------------
   # Epoch-based (default), effective batch = 64 × 4 = 256
-  python train.py --data-dir ../data --save-dir ./checkpoints \\
+  python train.py --data-dir /workspace/Datasets --save-dir ./checkpoints \\
       --batch-size 64 --accum-steps 4 --epochs 10
 
   # Step-based, train for 100 000 optimizer steps
-  python train.py --data-dir ../data --save-dir ./checkpoints \\
+  python train.py --data-dir /workspace/Datasets --save-dir ./checkpoints \\
       --batch-size 32 --accum-steps 8 --max-steps 100000
 
   # Resume from a checkpoint
-  python train.py --data-dir ../data --save-dir ./checkpoints \\
+  python train.py --data-dir /workspace/Datasets --save-dir ./checkpoints \\
       --resume ./checkpoints/best.pt
 """
 
@@ -55,13 +58,13 @@ from model import Seq2Seq
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train Seq2Seq EN→DE",
+        description="Train multilingual Seq2Seq NMT (many → English)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # ── Paths ─────────────────────────────────────────────────
     p.add_argument("--data-dir", type=str, required=True,
-                   help="Directory with train.en.txt, train.de.txt, newstest2014.*.txt")
+                   help="Root dataset directory (contains europarl-v10/, etc.)")
     p.add_argument("--save-dir", type=str, default="./checkpoints",
                    help="Directory for checkpoints")
     p.add_argument("--sp-dir", type=str, default=None,
@@ -102,7 +105,9 @@ def parse_args():
     p.add_argument("--patience", type=int, default=5,
                    help="Early stopping patience (validation rounds)")
     p.add_argument("--val-ratio", type=float, default=0.01,
-                   help="Fraction of training data held out for validation")
+                   help="Fraction of each (lang, dataset) held for validation")
+    p.add_argument("--test-ratio", type=float, default=0.01,
+                   help="Fraction of each (lang, dataset) held for testing")
     p.add_argument("--eval-every", type=int, default=None,
                    help="Run validation & checkpoint every N steps "
                         "(default: once per epoch)")
@@ -219,7 +224,7 @@ def train(args):
 
     # ── Banner ────────────────────────────────────────────────
     print("=" * 64)
-    print("  Seq2Seq Training")
+    print("  Multilingual Seq2Seq Training  (many → English)")
     print("=" * 64)
     print(f"  Device          : {device}")
     if device.type == "cuda":
@@ -236,6 +241,7 @@ def train(args):
         args.data_dir, sp_dir,
         vocab_size=args.vocab_size,
         val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
         seed=args.seed,
         max_train_lines=args.max_train_lines,
     )
