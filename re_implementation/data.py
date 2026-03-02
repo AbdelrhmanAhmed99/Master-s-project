@@ -25,10 +25,12 @@ Splitting strategy — 3-way stratified by (language, dataset):
 import gzip
 import hashlib
 import html
+import multiprocessing as mp
 import os
 import random
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from functools import partial
 from typing import Dict, List, Tuple
 
 import sentencepiece as spm
@@ -57,6 +59,7 @@ class SPTokenizer:
     """Thin wrapper around a SentencePiece model."""
 
     def __init__(self, model_path: str):
+        self.model_path = model_path
         self.sp = spm.SentencePieceProcessor(model_file=model_path)
 
     @property
@@ -65,6 +68,10 @@ class SPTokenizer:
 
     def encode(self, text: str) -> list:
         return self.sp.encode(text, out_type=int)
+
+    def encode_batch(self, texts: List[str]) -> List[List[int]]:
+        """Encode a batch of texts (uses SP's internal threading)."""
+        return [self.sp.encode(t, out_type=int) for t in texts]
 
     def decode_ids(self, ids) -> str:
         clean = [i for i in ids if i not in (PAD_ID, SOS_ID, EOS_ID)]
@@ -82,7 +89,7 @@ def _train_sentencepiece(
     model_prefix: str,
     vocab_size: int = 32000,
     model_type: str = "bpe",
-    num_threads: int = 4,
+    num_threads: int = 16,
     input_sentence_size: int = 5_000_000,
 ):
     """Train a shared SentencePiece BPE model on multiple text files."""
@@ -509,6 +516,21 @@ def _cache_key(sp_model_path: str, content_hash: str, max_lines: int) -> str:
     return h.hexdigest()[:16]
 
 
+# ── Multiprocessing worker for parallel encoding ─────────────
+
+def _encode_chunk(args):
+    """Worker: encode a chunk of (src, tgt) text pairs.
+
+    Each worker loads its own SentencePiece model (they're lightweight)
+    to avoid pickling issues and GIL contention.
+    """
+    model_path, texts_src, texts_tgt = args
+    sp = spm.SentencePieceProcessor(model_file=model_path)
+    src_ids = [sp.encode(t, out_type=int) for t in texts_src]
+    tgt_ids = [sp.encode(t, out_type=int) for t in texts_tgt]
+    return src_ids, tgt_ids
+
+
 def _encode_records(
     records: List[DataRecord],
     tokenizer: SPTokenizer,
@@ -516,9 +538,11 @@ def _encode_records(
     cache_dir: str,
     label: str,
     max_lines: int = 0,
+    num_workers: int = 16,
 ):
     """Encode (src, tgt) from records via SentencePiece; cache as .pt.
 
+    Uses multiprocessing to parallelise encoding across CPU cores.
     Returns (src_ids, tgt_ids) — both list[list[int]].
     """
     content_hash = _records_hash(records)
@@ -531,10 +555,39 @@ def _encode_records(
         return data["src"], data["tgt"]
 
     subset = records[:max_lines] if max_lines > 0 else records
-    src_ids, tgt_ids = [], []
-    for src, tgt, _, _ in tqdm(subset, desc=f"Encode {label}", leave=False):
-        src_ids.append(tokenizer.encode(src))
-        tgt_ids.append(tokenizer.encode(tgt))
+    n = len(subset)
+
+    # Decide parallelism: use multiprocessing for large sets, serial for small
+    effective_workers = min(num_workers, max(1, n // 50_000))
+
+    if effective_workers <= 1 or n < 100_000:
+        # Small set — serial is fine
+        src_ids, tgt_ids = [], []
+        for src, tgt, _, _ in tqdm(subset, desc=f"Encode {label}", leave=False):
+            src_ids.append(tokenizer.encode(src))
+            tgt_ids.append(tokenizer.encode(tgt))
+    else:
+        # Large set — split into chunks and encode in parallel
+        chunk_size = (n + effective_workers - 1) // effective_workers
+        chunks = []
+        for i in range(0, n, chunk_size):
+            batch = subset[i:i + chunk_size]
+            texts_src = [r[0] for r in batch]
+            texts_tgt = [r[1] for r in batch]
+            chunks.append((sp_model_path, texts_src, texts_tgt))
+
+        print(f"[data] Encoding {label} ({n:,} pairs) with "
+              f"{effective_workers} workers, chunk_size ~{chunk_size:,}")
+
+        src_ids, tgt_ids = [], []
+        with mp.Pool(processes=effective_workers) as pool:
+            for i, (s, t) in enumerate(
+                pool.imap(_encode_chunk, chunks), 1
+            ):
+                src_ids.extend(s)
+                tgt_ids.extend(t)
+                print(f"[data]   chunk {i}/{len(chunks)} done "
+                      f"({len(src_ids):,} / {n:,})")
 
     os.makedirs(cache_dir, exist_ok=True)
     torch.save({"src": src_ids, "tgt": tgt_ids}, cache_path)
@@ -547,11 +600,15 @@ def _encode_records(
 # ==============================================================
 
 def _dump_text(records: List[DataRecord], src_path: str, tgt_path: str):
-    """Write src + tgt lines for SentencePiece training (skip if exists)."""
+    """Write src + tgt lines for SentencePiece training (skip if exists).
+
+    Uses 8 MB write buffers to reduce I/O syscall overhead.
+    """
     if os.path.isfile(src_path) and os.path.isfile(tgt_path):
         return
-    with open(src_path, "w", encoding="utf-8") as fs, \
-         open(tgt_path, "w", encoding="utf-8") as ft:
+    BUF = 8 * 1024 * 1024  # 8 MB buffer
+    with open(src_path, "w", encoding="utf-8", buffering=BUF) as fs, \
+         open(tgt_path, "w", encoding="utf-8", buffering=BUF) as ft:
         for src, tgt, _, _ in records:
             fs.write(src + "\n")
             ft.write(tgt + "\n")
@@ -569,7 +626,7 @@ def prepare_data(
     val_ratio: float = 0.01,
     test_ratio: float = 0.01,
     seed: int = 42,
-    num_threads: int = 4,
+    num_threads: int = 16,
     max_train_lines: int = 0,
     *,
     test_dir: str = None,
@@ -673,17 +730,22 @@ def prepare_data(
     print("\n" + "=" * 64)
     print("  Step 4 : Encode")
     print("=" * 64)
+    # Use ~12.5% of cores (16 / 128) to leave headroom for OS + I/O
+    enc_workers = min(16, max(1, mp.cpu_count() // 8))
     tr_src, tr_tgt = _encode_records(
-        train_records, tokenizer, model_path, cache_dir, "train", max_train_lines,
+        train_records, tokenizer, model_path, cache_dir, "train",
+        max_train_lines, num_workers=enc_workers,
     )
     va_src, va_tgt = _encode_records(
         val_records, tokenizer, model_path, cache_dir, "val", 0,
+        num_workers=enc_workers,
     )
 
     # Build lightweight records for test encoding
     test_recs = [(s, t, "test", "corpus") for s, t in zip(test_src_lines, test_tgt_lines)]
     te_src, te_tgt = _encode_records(
         test_recs, tokenizer, model_path, cache_dir, "test", 0,
+        num_workers=enc_workers,
     )
 
     print(f"\n[data] ── Final ──  "
