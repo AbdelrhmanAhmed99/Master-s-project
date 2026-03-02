@@ -12,6 +12,7 @@
 # ==================================================================
 
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # flush prints immediately (no pipe buffering)
 
 # ── Config ────────────────────────────────────────────────────
 DATA_DIR="/workspace/Datasets"
