@@ -13,6 +13,7 @@
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1   # flush prints immediately (no pipe buffering)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── Config ────────────────────────────────────────────────────
 DATA_DIR="/workspace/Datasets"
@@ -30,8 +31,8 @@ DROPOUT=0.1
 
 # Training schedule
 EPOCHS=10
-BATCH_SIZE=32
-ACCUM_STEPS=4          # effective batch = 32 × 4 = 128
+BATCH_SIZE=512
+ACCUM_STEPS=1          # effective batch = 512 × 1 = 512
 LR=0.001
 CLIP=5.0
 PATIENCE=5
@@ -89,7 +90,7 @@ python3 train.py \
     --save-every "$SAVE_EVERY" \
     --log-every "$LOG_EVERY" \
     --amp \
-    --num-workers 4 \
+    --num-workers 8 \
     --seed "$SEED" \
     2>&1 | tee -a "$LOG_FILE"
 

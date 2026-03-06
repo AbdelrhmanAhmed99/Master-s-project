@@ -38,6 +38,9 @@ import os
 import sys
 import time
 
+import os as _os
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -379,13 +382,22 @@ def train(args):
         tgt_out = tgt_out.to(device)
 
         # ── Forward / backward (accumulate) ───────────────────
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            logits = model(src, src_lengths, tgt_in)
-            loss = compute_loss(logits, tgt_out)
-            # Normalise loss by accum_steps so gradients are averaged
-            loss_scaled = loss / args.accum_steps
+        try:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(src, src_lengths, tgt_in)
+                loss = compute_loss(logits, tgt_out)
+                # Normalise loss by accum_steps so gradients are averaged
+                loss_scaled = loss / args.accum_steps
 
-        scaler.scale(loss_scaled).backward()
+            scaler.scale(loss_scaled).backward()
+        except torch.cuda.OutOfMemoryError:
+            # OOM on an outlier batch — free memory, skip, and continue
+            print(f"  ⚠  OOM at micro-step {micro_step} "
+                  f"(src {src.shape}, tgt {tgt_in.shape}) — skipping batch")
+            torch.cuda.empty_cache()
+            optimizer.zero_grad(set_to_none=True)
+            micro_step = 0  # reset accumulation counter
+            continue
 
         # Token / sentence bookkeeping (use un-scaled loss)
         mask = (tgt_out != PAD_ID)

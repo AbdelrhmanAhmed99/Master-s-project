@@ -25,13 +25,14 @@ Splitting strategy — 3-way stratified by (language, dataset):
 import gzip
 import hashlib
 import html
+import json
 import multiprocessing as mp
 import os
 import random
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sentencepiece as spm
 import torch
@@ -143,8 +144,14 @@ class TranslationDataset(torch.utils.data.Dataset):
         return self.src[idx], self.tgt[idx]
 
 
-def collate_fn(batch, pad_id: int = PAD_ID):
+MAX_SEQ_LEN = 256   # truncate any sequence longer than this (in BPE tokens)
+
+
+def collate_fn(batch, pad_id: int = PAD_ID, max_len: int = MAX_SEQ_LEN):
     """Collate (src_ids, tgt_ids) pairs into padded tensors.
+
+    Sequences longer than *max_len* are truncated to prevent OOM on
+    outlier-length batches.
 
     Returns
     -------
@@ -154,6 +161,10 @@ def collate_fn(batch, pad_id: int = PAD_ID):
     tgt_out     (batch, tgt_len)  — tokens + </s>
     """
     src_ids, tgt_ids = zip(*batch)
+
+    # Truncate to max_len
+    src_ids = [s[:max_len] for s in src_ids]
+    tgt_ids = [t[:max_len] for t in tgt_ids]
 
     src_lengths = torch.tensor([len(s) for s in src_ids], dtype=torch.long)
     src = pad_sequence(
@@ -185,6 +196,8 @@ def get_dataloader(dataset: TranslationDataset, batch_size: int,
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
 
@@ -580,14 +593,15 @@ def _encode_records(
               f"{effective_workers} workers, chunk_size ~{chunk_size:,}")
 
         src_ids, tgt_ids = [], []
+        pbar = tqdm(total=n, desc=f"Encode {label}", unit=" pairs")
         with mp.Pool(processes=effective_workers) as pool:
             for i, (s, t) in enumerate(
                 pool.imap(_encode_chunk, chunks), 1
             ):
                 src_ids.extend(s)
                 tgt_ids.extend(t)
-                print(f"[data]   chunk {i}/{len(chunks)} done "
-                      f"({len(src_ids):,} / {n:,})")
+                pbar.update(len(s))
+        pbar.close()
 
     os.makedirs(cache_dir, exist_ok=True)
     torch.save({"src": src_ids, "tgt": tgt_ids}, cache_path)
@@ -613,6 +627,154 @@ def _dump_text(records: List[DataRecord], src_path: str, tgt_path: str):
             fs.write(src + "\n")
             ft.write(tgt + "\n")
     print(f"[data] Wrote SP training text ({len(records):,} pairs)")
+
+
+# ==============================================================
+# Fast-path manifest (skip Steps 1-2 on subsequent runs)
+# ==============================================================
+
+MANIFEST_VERSION = 1
+MANIFEST_FILE = "data_manifest.json"
+
+
+def _data_files_fingerprint(data_dir: str) -> str:
+    """Hash all input data file paths + sizes without reading them.
+
+    Covers: europarl .tsv.gz, news_commentary .tsv.gz,
+    wikimatrix .tsv.gz, tilde .tmx files.
+    """
+    entries: List[Tuple[str, int]] = []
+    for sub in ("europarl-v10", "news_commentary_v18_en", "wikimatrix_en_pairs"):
+        d = os.path.join(data_dir, sub)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            fp = os.path.join(d, f)
+            if os.path.isfile(fp):
+                entries.append((fp, os.path.getsize(fp)))
+    d = os.path.join(data_dir, "tilde_model_corpus")
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".tmx"):
+                fp = os.path.join(d, f)
+                entries.append((fp, os.path.getsize(fp)))
+    h = hashlib.sha256()
+    for path, size in entries:
+        h.update(f"{path}:{size}\n".encode())
+    return h.hexdigest()[:24]
+
+
+def _sp_model_hash(sp_model_path: str) -> str:
+    """Hash the SP model file (small, fast)."""
+    h = hashlib.sha256()
+    with open(sp_model_path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()[:16]
+
+
+def _save_manifest(
+    cache_dir: str,
+    data_fp: str,
+    sp_hash: str,
+    params: dict,
+    cache_files: Dict[str, str],
+    counts: Dict[str, int],
+):
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "data_fingerprint": data_fp,
+        "sp_model_hash": sp_hash,
+        "params": params,
+        "cache_files": cache_files,
+        "counts": counts,
+    }
+    path = os.path.join(cache_dir, MANIFEST_FILE)
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[data] Saved manifest → {path}")
+
+
+def _try_fast_path(
+    cache_dir: str,
+    sp_dir: str,
+    data_dir: str,
+    test_dir: str,
+    params: dict,
+) -> Optional[tuple]:
+    """Try to skip Steps 1-2 by loading from manifest + cached .pt files.
+
+    Returns the same tuple as prepare_data() on success, or None if the
+    fast path cannot be used (manifest missing/stale, cache files missing).
+    """
+    manifest_path = os.path.join(cache_dir, MANIFEST_FILE)
+    if not os.path.isfile(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path) as f:
+            m = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if m.get("version") != MANIFEST_VERSION:
+        return None
+
+    # Check parameters match
+    if m.get("params") != params:
+        print("[data] Manifest params changed — full reload required.")
+        return None
+
+    # Check data fingerprint
+    current_fp = _data_files_fingerprint(data_dir)
+    if m.get("data_fingerprint") != current_fp:
+        print("[data] Data files changed — full reload required.")
+        return None
+
+    # Check SP model
+    sp_model_path = os.path.join(sp_dir, "sp_bpe.model")
+    if not os.path.isfile(sp_model_path):
+        return None
+    if m.get("sp_model_hash") != _sp_model_hash(sp_model_path):
+        print("[data] SP model changed — full reload required.")
+        return None
+
+    # Check all cache .pt files exist
+    cache_files = m.get("cache_files", {})
+    for label in ("train", "val", "test"):
+        fname = cache_files.get(label)
+        if not fname or not os.path.isfile(os.path.join(cache_dir, fname)):
+            print(f"[data] Cache file for {label} missing — full reload required.")
+            return None
+
+    # Check test TSVs exist
+    if not _test_sets_exist(test_dir):
+        print("[data] Test TSVs missing — full reload required.")
+        return None
+
+    # ── All checks passed — load from cache ──
+    print("\n" + "=" * 64)
+    print("  FAST PATH : Loading from manifest + cached .pt files")
+    print("=" * 64)
+
+    tokenizer = SPTokenizer(sp_model_path)
+    print(f"[data] Loaded SP model → {sp_model_path}  (vocab={tokenizer.vocab_size:,})")
+
+    tr = torch.load(os.path.join(cache_dir, cache_files["train"]), weights_only=False)
+    va = torch.load(os.path.join(cache_dir, cache_files["val"]), weights_only=False)
+    te = torch.load(os.path.join(cache_dir, cache_files["test"]), weights_only=False)
+    print(f"[data] Loaded cached train={len(tr['src']):,}  "
+          f"val={len(va['src']):,}  test={len(te['src']):,}")
+
+    test_src_lines, test_tgt_lines, _, _ = load_test_sets(test_dir)
+    print(f"[data] Loaded test text → {len(test_src_lines):,} pairs")
+
+    return (
+        tokenizer,
+        (tr["src"], tr["tgt"]),
+        (va["src"], va["tgt"]),
+        (test_src_lines, test_tgt_lines),
+        (te["src"], te["tgt"]),
+    )
 
 
 # ==============================================================
@@ -660,6 +822,19 @@ def prepare_data(
         test_dir = os.path.join(data_dir, "test_sets")
     cache_dir = os.path.join(sp_dir, "cache")
     os.makedirs(cache_dir, exist_ok=True)
+
+    # ── Fast-path: skip Steps 1-2 if manifest + caches valid ─
+    params_key = {
+        "val_ratio": val_ratio,
+        "test_ratio": test_ratio,
+        "seed": seed,
+        "vocab_size": vocab_size,
+        "max_train_lines": max_train_lines,
+        "wikimatrix_min_score": wikimatrix_min_score,
+    }
+    fast = _try_fast_path(cache_dir, sp_dir, data_dir, test_dir, params_key)
+    if fast is not None:
+        return fast
 
     # ── 1. Load all parallel corpora ──────────────────────────
     print("\n" + "=" * 64)
@@ -751,6 +926,26 @@ def prepare_data(
     print(f"\n[data] ── Final ──  "
           f"train: {len(tr_src):,}  val: {len(va_src):,}  "
           f"test: {len(te_src):,}")
+
+    # ── Save manifest for fast-path on subsequent runs ────────
+    data_fp = _data_files_fingerprint(data_dir)
+    sp_hash = _sp_model_hash(model_path)
+    # Find the actual cache filenames that were written
+    cache_files_map = {}
+    for label in ("train", "val", "test"):
+        matches = [f for f in os.listdir(cache_dir)
+                   if f.startswith(f"{label}_") and f.endswith(".pt")]
+        if matches:
+            # Use the most recently modified one
+            matches.sort(key=lambda f: os.path.getmtime(os.path.join(cache_dir, f)),
+                         reverse=True)
+            cache_files_map[label] = matches[0]
+    if len(cache_files_map) == 3:
+        _save_manifest(
+            cache_dir, data_fp, sp_hash, params_key,
+            cache_files_map,
+            {"train": len(tr_src), "val": len(va_src), "test": len(te_src)},
+        )
 
     return (
         tokenizer,
